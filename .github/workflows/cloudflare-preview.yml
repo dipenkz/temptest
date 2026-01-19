@@ -11,7 +11,7 @@ on:
 permissions:
   contents: write
   issues: write
-  pull-requests: read
+  pull-requests: write
   deployments: write
 
 jobs:
@@ -36,13 +36,14 @@ jobs:
         # next.config.ts must contain: export default { output: "export" }
 
       - name: Deploy to Cloudflare Pages
+        id: cf
         uses: cloudflare/pages-action@v1
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           projectName: ci-cd-static-page-preview
           directory: out
-          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
+          gitHubToken: ${{ secrets.GITHUBTOKEN }}
           branch: ${{ github.head_ref || github.ref_name }}
           wranglerVersion: 4
 
@@ -53,26 +54,24 @@ jobs:
           SAFE=$(echo "$BRANCH" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9._-]#-#g')
           echo "url=https://${SAFE}.ci-cd-static-page-preview.pages.dev" >> $GITHUB_OUTPUT
 
-      # ---------- COUNT COMMENTS ----------
+      # --- Count comments (commit + PR issue + PR review) ---
       - name: Count comments
         id: count
         uses: actions/github-script@v6
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.GITHUBTOKEN }}
           script: |
             const { owner, repo } = context.repo;
             const branch =
               context.payload.pull_request?.head?.ref ||
               process.env.GITHUB_REF_NAME ||
-              context.ref.replace('refs/heads/', '');
+              (context.ref || '').replace('refs/heads/', '');
 
-            // get commits on branch
             const commits = await github.paginate(
               github.rest.repos.listCommits,
               { owner, repo, sha: branch, per_page: 100 }
             );
 
-            // count commit comments
             const commit = (await Promise.all(
               commits.map(c =>
                 github.paginate(
@@ -82,7 +81,6 @@ jobs:
               )
             )).reduce((s, a) => s + a.length, 0);
 
-            // find PR if exists
             const pr =
               context.payload.pull_request?.number ||
               (await github.rest.pulls.list({
@@ -107,41 +105,30 @@ jobs:
                 )).length
               : 0;
 
-            core.setOutput('commit', commit.toString());
-            core.setOutput('issue', issue.toString());
-            core.setOutput('review', review.toString());
-            core.setOutput('total', (commit + issue + review).toString());
+            core.setOutput('commit', String(commit));
+            core.setOutput('issue', String(issue));
+            core.setOutput('review', String(review));
+            core.setOutput('total', String(commit + issue + review));
 
-      # ---------- PR COMMENT (ONCE PER PR) ----------
-      # - name: Post PR preview comment
-      #   if: ${{ steps.count.outputs.pr != '' }}
-      #   uses: peter-evans/create-or-update-comment@v4
-      #   with:
-      #     token: ${{ secrets.GITHUB_TOKEN }}
-      #     issue-number: ${{ steps.count.outputs.pr }}
-      #     body: |
-      #       🚀 **Preview for `${{ github.head_ref || github.ref_name }}`**
-      #       🔗 ${{ steps.url.outputs.url }}
-
-      - name: Post PR preview comment
-        if: ${{ ( github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' ) && steps.count.outputs.issue == '0' && steps.count.outputs.review == '0' }} 
+      # --- Comment only when NO comments exist ---
+      - name: Post / Update PR comment (if 0 comments)
+        if: ${{ github.event_name == 'pull_request' && steps.count.outputs.total == '0' }}
         uses: peter-evans/create-or-update-comment@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           issue-number: ${{ github.event.pull_request.number }}
           body: |
-            🚀 **Preview for `${{ github.head_ref }}`**
+            🚀 **Preview for `${{ github.head_ref || github.ref_name }}`**
             🔗 ${{ steps.url.outputs.url }}
 
-      # ---------- COMMIT COMMENT (ONCE PER BRANCH) ----------
-      - name: Post commit preview comment
-        if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.count.outputs.commit == '0' }}
+      - name: Comment on commit (if 0 comments)
+        if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.count.outputs.total == '0' }}
         uses: peter-evans/commit-comment@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           sha: ${{ github.sha }}
           body: |
-            🚀 **Preview for `${{ github.ref_name }}`**
+            🚀 **Preview for `${{ github.ref_name || github.head_ref }}`**
             🔗 ${{ steps.url.outputs.url }}
 
       - name: Print totals
