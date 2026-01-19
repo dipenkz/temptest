@@ -1,19 +1,21 @@
-name: Cloudflare Preview
+name: Cloudflare Preview (with conditional comment)
 
 on:
   workflow_dispatch:
   push:
     branches-ignore: [main]
   pull_request:
+     types: [opened, reopened, synchronize]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: read
+  deployments: write
 
 jobs:
-  deploy:
+  preview:
     runs-on: ubuntu-latest
-
-    permissions:
-      contents: read
-      pull-requests: write
-      deployments: write
 
     steps:
       - name: Checkout
@@ -25,48 +27,125 @@ jobs:
           node-version: 24
           cache: npm
 
-      - name: Install
+      - name: Install dependencies
         run: npm ci
 
       - name: Build (static export)
         run: npm run build
-        # next.config.ts must set: output: "export" so Next writes out/
-        # make changes in next.config.ts according to it 
+        # next.config.ts must contain: export default { output: "export" }
 
       - name: Deploy to Cloudflare Pages
-        id: cf
         uses: cloudflare/pages-action@v1
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           projectName: ci-cd-static-page-preview
           directory: out
-          gitHubToken: ${{ secrets.GITHUBTOKEN }}
+          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
           branch: ${{ github.head_ref || github.ref_name }}
+          wranglerVersion: 4
 
       - name: Compute stable preview URL
         id: url
         run: |
           BRANCH="${{ github.head_ref || github.ref_name }}"
-          # Normalize branch: lowercase and replace unsafe chars with '-'
           SAFE=$(echo "$BRANCH" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9._-]#-#g')
           echo "url=https://${SAFE}.ci-cd-static-page-preview.pages.dev" >> $GITHUB_OUTPUT
 
-      - name: Comment preview URL on PR
-        if: github.event_name == 'pull_request'
+      # ---------- COUNT COMMENTS ----------
+      - name: Count comments
+        id: count
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const branch =
+              context.payload.pull_request?.head?.ref ||
+              process.env.GITHUB_REF_NAME ||
+              context.ref.replace('refs/heads/', '');
+
+            // get commits on branch
+            const commits = await github.paginate(
+              github.rest.repos.listCommits,
+              { owner, repo, sha: branch, per_page: 100 }
+            );
+
+            // count commit comments
+            const commit = (await Promise.all(
+              commits.map(c =>
+                github.paginate(
+                  github.rest.repos.listCommentsForCommit,
+                  { owner, repo, commit_sha: c.sha, per_page: 100 }
+                )
+              )
+            )).reduce((s, a) => s + a.length, 0);
+
+            // find PR if exists
+            const pr =
+              context.payload.pull_request?.number ||
+              (await github.rest.pulls.list({
+                owner,
+                repo,
+                head: `${owner}:${branch}`,
+                state: 'open',
+                per_page: 1
+              })).data[0]?.number;
+
+            const issue = pr
+              ? (await github.paginate(
+                  github.rest.issues.listComments,
+                  { owner, repo, issue_number: pr, per_page: 100 }
+                )).length
+              : 0;
+
+            const review = pr
+              ? (await github.paginate(
+                  github.rest.pulls.listReviewComments,
+                  { owner, repo, pull_number: pr, per_page: 100 }
+                )).length
+              : 0;
+
+            core.setOutput('commit', commit.toString());
+            core.setOutput('issue', issue.toString());
+            core.setOutput('review', review.toString());
+            core.setOutput('total', (commit + issue + review).toString());
+
+      # ---------- PR COMMENT (ONCE PER PR) ----------
+      # - name: Post PR preview comment
+      #   if: ${{ steps.count.outputs.pr != '' }}
+      #   uses: peter-evans/create-or-update-comment@v4
+      #   with:
+      #     token: ${{ secrets.GITHUB_TOKEN }}
+      #     issue-number: ${{ steps.count.outputs.pr }}
+      #     body: |
+      #       🚀 **Preview for `${{ github.head_ref || github.ref_name }}`**
+      #       🔗 ${{ steps.url.outputs.url }}
+
+      - name: Post PR preview comment
+        if: ${{ ( github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' ) && steps.count.outputs.issue == '0' && steps.count.outputs.review == '0' }} 
         uses: peter-evans/create-or-update-comment@v4
         with:
-          token: ${{ secrets.GITHUBTOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
           issue-number: ${{ github.event.pull_request.number }}
           body: |
-            🚀 **Preview for `${{ github.head_ref || github.ref_name }}`**
+            🚀 **Preview for `${{ github.head_ref }}`**
             🔗 ${{ steps.url.outputs.url }}
 
-      - name: Comment preview URL on Commit
-        if: github.event_name == 'push'
+      # ---------- COMMIT COMMENT (ONCE PER BRANCH) ----------
+      - name: Post commit preview comment
+        if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.count.outputs.commit == '0' }}
         uses: peter-evans/commit-comment@v2
         with:
-          token: ${{ secrets.GITHUBTOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          sha: ${{ github.sha }}
           body: |
             🚀 **Preview for `${{ github.ref_name }}`**
             🔗 ${{ steps.url.outputs.url }}
+
+      - name: Print totals
+        run: |
+          echo "Commit comments: ${{ steps.count.outputs.commit }}"
+          echo "PR issue comments: ${{ steps.count.outputs.issue }}"
+          echo "PR review comments: ${{ steps.count.outputs.review }}"
+          echo "Total comments: ${{ steps.count.outputs.total }}"
