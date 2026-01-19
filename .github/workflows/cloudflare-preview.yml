@@ -130,13 +130,3 @@ jobs:
           echo "PR issue comments: ${{ steps.count.outputs.issue }}"
           echo "PR review comments: ${{ steps.count.outputs.review }}"
           echo "Total PR comments: ${{ steps.count.outputs.total }}"
-
-      - name: Comment on commit (if 0 comments)
-        if: ${{ github.event_name == 'push'  && steps.count.outputs.total == '0' }}
-        uses: peter-evans/commit-comment@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          sha: ${{ github.sha }}
-          body: |
-            🚀 **Preview for `${{ github.ref_name || github.head_ref }}`**
-            🔗 ${{ steps.url.outputs.url }}
