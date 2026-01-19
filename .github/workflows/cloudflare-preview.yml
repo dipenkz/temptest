@@ -1,4 +1,4 @@
-name: Cloudflare Preview (with conditional comment)
+name: Cloudflare Preview (Stable PR Source Preview)
 
 on:
   workflow_dispatch:
@@ -7,9 +7,8 @@ on:
   pull_request_target:
     types: [opened, reopened, synchronize]
 
-
 permissions:
-  contents: write
+  contents: read
   issues: write
   pull-requests: write
   deployments: write
@@ -19,22 +18,39 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # - name: Checkout
-      #   uses: actions/checkout@v4
+      # ------------------------------------------------------------
+      # 1. Checkout PR SOURCE code (CRITICAL FIX)
+      # ------------------------------------------------------------
+      - name: Checkout PR source branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
 
+      # ------------------------------------------------------------
+      # 2. Setup Node
+      # ------------------------------------------------------------
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
 
+      # ------------------------------------------------------------
+      # 3. Install dependencies
+      # ------------------------------------------------------------
       - name: Install dependencies
         run: npm ci
 
+      # ------------------------------------------------------------
+      # 4. Build static site (Next.js export)
+      # next.config.ts must contain: export default { output: "export" }
+      # ------------------------------------------------------------
       - name: Build (static export)
         run: npm run build
-        # next.config.ts must contain: export default { output: "export" }
 
+      # ------------------------------------------------------------
+      # 5. Deploy to Cloudflare Pages
+      # ------------------------------------------------------------
       - name: Deploy to Cloudflare Pages
         id: cf
         uses: cloudflare/pages-action@v1
@@ -43,10 +59,13 @@ jobs:
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           projectName: ci-cd-static-page-preview
           directory: out
-          gitHubToken: ${{ secrets.GITHUBTOKEN }}
+          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
           branch: ${{ github.head_ref || github.ref_name }}
           wranglerVersion: 4
 
+      # ------------------------------------------------------------
+      # 6. Compute STABLE preview URL from SOURCE branch name
+      # ------------------------------------------------------------
       - name: Compute stable preview URL
         id: url
         run: |
@@ -54,86 +73,60 @@ jobs:
           SAFE=$(echo "$BRANCH" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9._-]#-#g')
           echo "url=https://${SAFE}.ci-cd-static-page-preview.pages.dev" >> $GITHUB_OUTPUT
 
-      # --- Count comments (commit + PR issue + PR review) ---
-      - name: Count comments
+      # ------------------------------------------------------------
+      # 7. Count existing PR comments (issue + review)
+      # ------------------------------------------------------------
+      - name: Count PR comments
         id: count
         uses: actions/github-script@v6
         with:
-          github-token: ${{ secrets.GITHUBTOKEN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const { owner, repo } = context.repo;
-            const branch =
-              context.payload.pull_request?.head?.ref ||
-              process.env.GITHUB_REF_NAME ||
-              (context.ref || '').replace('refs/heads/', '');
+            const pr = context.payload.pull_request?.number;
 
-            const commits = await github.paginate(
-              github.rest.repos.listCommits,
-              { owner, repo, sha: branch, per_page: 100 }
-            );
+            let issue = 0;
+            let review = 0;
 
-            const commit = (await Promise.all(
-              commits.map(c =>
-                github.paginate(
-                  github.rest.repos.listCommentsForCommit,
-                  { owner, repo, commit_sha: c.sha, per_page: 100 }
-                )
-              )
-            )).reduce((s, a) => s + a.length, 0);
+            if (pr) {
+              issue = (await github.paginate(
+                github.rest.issues.listComments,
+                { owner, repo, issue_number: pr, per_page: 100 }
+              )).length;
 
-            const pr =
-              context.payload.pull_request?.number ||
-              (await github.rest.pulls.list({
-                owner,
-                repo,
-                head: `${owner}:${branch}`,
-                state: 'open',
-                per_page: 1
-              })).data[0]?.number;
+              review = (await github.paginate(
+                github.rest.pulls.listReviewComments,
+                { owner, repo, pull_number: pr, per_page: 100 }
+              )).length;
+            }
 
-            const issue = pr
-              ? (await github.paginate(
-                  github.rest.issues.listComments,
-                  { owner, repo, issue_number: pr, per_page: 100 }
-                )).length
-              : 0;
-
-            const review = pr
-              ? (await github.paginate(
-                  github.rest.pulls.listReviewComments,
-                  { owner, repo, pull_number: pr, per_page: 100 }
-                )).length
-              : 0;
-
-            core.setOutput('commit', String(commit));
             core.setOutput('issue', String(issue));
             core.setOutput('review', String(review));
-            core.setOutput('total', String(commit + issue + review));
+            core.setOutput('total', String(issue + review));
 
-      # --- Comment only when NO comments exist ---
-      - name: Post / Update PR comment (if 0 comments)
-        if: ${{ github.event_name == 'pull_request_target' && steps.count.outputs.issue == '0' && steps.count.outputs.review == '0' }}
+      # ------------------------------------------------------------
+      # 8. Post preview comment ONLY if no comments exist
+      # ------------------------------------------------------------
+      - name: Post PR preview comment (only once)
+        if: ${{ github.event_name == 'pull_request_target' && steps.count.outputs.total == '0' }}
         uses: peter-evans/create-or-update-comment@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           issue-number: ${{ github.event.pull_request.number }}
           body: |
-            🚀 **Preview for `${{ github.head_ref || github.ref_name }}`**
-            🔗 ${{ steps.url.outputs.url }}
+            🚀 **Preview for `${{ github.head_ref }}`**
 
-      - name: Comment on commit (if 0 comments)
-        if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.count.outputs.total == '0' }}
-        uses: peter-evans/commit-comment@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          sha: ${{ github.sha }}
-          body: |
-            🚀 **Preview for `${{ github.ref_name || github.head_ref }}`**
-            🔗 ${{ steps.url.outputs.url }}
+            🔗 **Stable Preview URL**  
+            ${{ steps.url.outputs.url }}
 
-      - name: Print totals
+            ✅ Built from **PR source branch**  
+            🔄 Updates automatically on every push
+
+      # ------------------------------------------------------------
+      # 9. Debug output (logs only)
+      # ------------------------------------------------------------
+      - name: Print comment totals
         run: |
-          echo "Commit comments: ${{ steps.count.outputs.commit }}"
           echo "PR issue comments: ${{ steps.count.outputs.issue }}"
           echo "PR review comments: ${{ steps.count.outputs.review }}"
-          echo "Total comments: ${{ steps.count.outputs.total }}"
+          echo "Total PR comments: ${{ steps.count.outputs.total }}"
